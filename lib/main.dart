@@ -16,6 +16,7 @@ import 'package:pdfx/pdfx.dart';
 import 'package:flutter/services.dart';
 import 'package:photo_view/photo_view.dart';
 import 'package:http/http.dart' as http;
+import 'package:qr_code_scanner/qr_code_scanner.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1249,6 +1250,7 @@ class DatabaseHelper {
         timestamp TEXT NOT NULL,
         verifiedByGPS INTEGER NOT NULL,
         photoPath TEXT,
+        qrCodeData TEXT,
         FOREIGN KEY (studentId) REFERENCES users (id)
       )
     ''');
@@ -1260,7 +1262,8 @@ class DatabaseHelper {
         name TEXT NOT NULL,
         latitude REAL NOT NULL,
         longitude REAL NOT NULL,
-        radius REAL NOT NULL
+        radius REAL NOT NULL,
+        qrCodeData TEXT
       )
     ''');
 
@@ -1331,13 +1334,14 @@ class DatabaseHelper {
       )
     ''');
 
-    // Insert default classrooms
+    // Insert default classrooms with QR code data
     await db.insert('classrooms', {
       'id': 'room_101',
       'name': 'Classroom 101',
       'latitude': 4.0511,
       'longitude': 9.7679,
       'radius': 50.0,
+      'qrCodeData': 'CLASSROOM_101_${DateTime.now().millisecondsSinceEpoch}',
     });
 
     await db.insert('classrooms', {
@@ -1346,6 +1350,7 @@ class DatabaseHelper {
       'latitude': 4.0512,
       'longitude': 9.7678,
       'radius': 50.0,
+      'qrCodeData': 'CLASSROOM_102_${DateTime.now().millisecondsSinceEpoch}',
     });
 
     await db.insert('classrooms', {
@@ -1354,6 +1359,7 @@ class DatabaseHelper {
       'latitude': 4.0513,
       'longitude': 9.7677,
       'radius': 50.0,
+      'qrCodeData': 'LAB_201_${DateTime.now().millisecondsSinceEpoch}',
     });
 
     // Insert admin user with new credentials
@@ -1547,6 +1553,9 @@ startxref
     if (oldVersion < 3) {
       // Add fileContent column to papers table
       await db.execute('ALTER TABLE papers ADD COLUMN fileContent BLOB');
+      // Add QR code columns
+      await db.execute('ALTER TABLE attendance ADD COLUMN qrCodeData TEXT');
+      await db.execute('ALTER TABLE classrooms ADD COLUMN qrCodeData TEXT');
     }
 
     if (oldVersion < 4) {
@@ -1681,6 +1690,16 @@ startxref
   Future<List<Map<String, dynamic>>> getAllClassrooms() async {
     final db = await instance.database;
     return await db.query('classrooms');
+  }
+
+  Future<Map<String, dynamic>?> getClassroomByQRCode(String qrCodeData) async {
+    final db = await instance.database;
+    final results = await db.query(
+      'classrooms',
+      where: 'qrCodeData = ?',
+      whereArgs: [qrCodeData],
+    );
+    return results.isNotEmpty ? results.first : null;
   }
 
   Future<int> insertClassroom(Map<String, dynamic> classroom) async {
@@ -2541,6 +2560,240 @@ class AIQuestionManager {
   }
 }
 
+// 🔥 NEW: QR Code Scanner Screen
+class QRScannerScreen extends StatefulWidget {
+  final String userId;
+  final String userName;
+
+  const QRScannerScreen({
+    super.key,
+    required this.userId,
+    required this.userName,
+  });
+
+  @override
+  State<QRScannerScreen> createState() => _QRScannerScreenState();
+}
+
+class _QRScannerScreenState extends State<QRScannerScreen> {
+  final GlobalKey qrKey = GlobalKey(debugLabel: 'QR');
+  QRViewController? controller;
+  String result = '';
+  bool isScanning = true;
+
+  @override
+  void dispose() {
+    controller?.dispose();
+    super.dispose();
+  }
+
+  void _onQRViewCreated(QRViewController controller) {
+    this.controller = controller;
+    controller.scannedDataStream.listen((scanData) {
+      if (isScanning) {
+        setState(() {
+          result = scanData.code!;
+          isScanning = false;
+        });
+        _processQRCode(result);
+      }
+    });
+  }
+
+  Future<void> _processQRCode(String qrData) async {
+    try {
+      // Check if QR code corresponds to a classroom
+      final classroom = await DatabaseHelper.instance.getClassroomByQRCode(
+        qrData,
+      );
+
+      if (classroom != null) {
+        // Mark attendance
+        await _markAttendanceWithQR(classroom['id'], qrData);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: Color(0xFFF44336),
+            content: Text('Invalid QR Code - No classroom found'),
+          ),
+        );
+        _resetScanner();
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFFF44336),
+          content: Text('Error: $e'),
+        ),
+      );
+      _resetScanner();
+    }
+  }
+
+  Future<void> _markAttendanceWithQR(String classroomId, String qrData) async {
+    try {
+      final locationService = LocationService();
+      final currentLocation = await locationService.getCurrentLocation();
+
+      final isInClassroom = await locationService.isInClassroom(
+        classroomId,
+        currentLocation,
+      );
+
+      if (!isInClassroom) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: Color(0xFFF44336),
+            content: Text('You are not in the classroom area'),
+          ),
+        );
+        _resetScanner();
+        return;
+      }
+
+      await DatabaseHelper.instance.insertAttendance({
+        'studentId': widget.userId,
+        'studentName': widget.userName,
+        'studentEmail': widget.userId.contains('@')
+            ? widget.userId
+            : '${widget.userId}@paperlink.edu',
+        'classroomId': classroomId,
+        'latitude': currentLocation.latitude,
+        'longitude': currentLocation.longitude,
+        'timestamp': DateTime.now().toString(),
+        'verifiedByGPS': isInClassroom ? 1 : 0,
+        'qrCodeData': qrData,
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          backgroundColor: Color(0xFF4CAF50),
+          content: Text('Attendance marked successfully with QR Code!'),
+        ),
+      );
+
+      await Future.delayed(const Duration(seconds: 2));
+      Navigator.pop(context);
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFFF44336),
+          content: Text('Error: $e'),
+        ),
+      );
+      _resetScanner();
+    }
+  }
+
+  void _resetScanner() {
+    setState(() {
+      isScanning = true;
+      result = '';
+    });
+    controller?.resumeCamera();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        title: const Text(
+          'Scan QR Code',
+          style: TextStyle(color: Colors.white),
+        ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: isScanning
+                ? QRView(
+                    key: qrKey,
+                    onQRViewCreated: _onQRViewCreated,
+                    overlay: QrScannerOverlayShape(
+                      borderColor: Colors.green,
+                      borderRadius: 10,
+                      borderLength: 30,
+                      borderWidth: 10,
+                      cutOutSize: 250,
+                    ),
+                  )
+                : Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(
+                          Icons.check_circle,
+                          size: 80,
+                          color: Colors.green,
+                        ),
+                        const SizedBox(height: 20),
+                        const Text(
+                          'QR Code Scanned!',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          'Processing: $result',
+                          style: const TextStyle(color: Colors.white70),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          Container(
+            padding: const EdgeInsets.all(20),
+            color: Colors.black,
+            child: Column(
+              children: [
+                const Text(
+                  'Scan Classroom QR Code',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'Position the QR code within the frame',
+                  style: TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    ElevatedButton.icon(
+                      onPressed: () => controller?.toggleFlash(),
+                      icon: const Icon(Icons.flash_on),
+                      label: const Text('Toggle Flash'),
+                    ),
+                    ElevatedButton.icon(
+                      onPressed: _resetScanner,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Scan Again'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // Dashboard Screen - Combined features (Updated with theme toggle)
 class DashboardScreen extends StatefulWidget {
   final String role;
@@ -2710,62 +2963,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  Future<void> _markAttendanceWithPhoto(String classroomId) async {
-    if (_currentUser == null || _currentLocation == null) return;
+  Future<void> _markAttendanceWithQR() async {
+    if (_currentUser == null) return;
 
-    try {
-      final isInClassroom = await _locationService.isInClassroom(
-        classroomId,
-        _currentLocation!,
-      );
-      if (!isInClassroom) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            backgroundColor: Color(0xFFF44336),
-            content: Text('You are not in the classroom area'),
-          ),
-        );
-        return;
-      }
-
-      final File? photo = await _cameraService.takePhoto();
-      if (photo == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            backgroundColor: Color(0xFFF44336),
-            content: Text('Please take a photo to mark attendance'),
-          ),
-        );
-        return;
-      }
-
-      await DatabaseHelper.instance.insertAttendance({
-        'studentId': _currentUser!['id'],
-        'studentName':
-            '${_currentUser!['firstName']} ${_currentUser!['lastName']}',
-        'studentEmail': _currentUser!['email'],
-        'classroomId': classroomId,
-        'latitude': _currentLocation!.latitude,
-        'longitude': _currentLocation!.longitude,
-        'timestamp': DateTime.now().toString(),
-        'verifiedByGPS': isInClassroom ? 1 : 0,
-        'photoPath': photo.path,
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          backgroundColor: Color(0xFF4CAF50),
-          content: Text('Attendance marked successfully with photo!'),
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => QRScannerScreen(
+          userId: _currentUser!['id'],
+          userName:
+              '${_currentUser!['firstName']} ${_currentUser!['lastName']}',
         ),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: const Color(0xFFF44336),
-          content: Text('Error: $e'),
-        ),
-      );
-    }
+      ),
+    );
   }
 
   @override
@@ -3065,6 +3275,61 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ),
               ),
 
+              if (widget.role != 'admin' && !gpsEnabled)
+                Container(
+                  margin: const EdgeInsets.all(20),
+                  padding: const EdgeInsets.all(15),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(color: Colors.red.withOpacity(0.3)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.gps_off, color: Colors.red),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'GPS Disabled',
+                              style: TextStyle(
+                                color: Colors.red,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const Text(
+                              'Contact admin to enable GPS tracking',
+                              style: TextStyle(
+                                color: const Color.fromRGBO(
+                                  255,
+                                  0,
+                                  0,
+                                  0.8,
+                                ), // Fixed: using fromRGBO
+                                fontSize: 12,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            if (widget.role == 'student')
+                              ElevatedButton(
+                                onPressed: _markAttendanceWithQR,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF4CAF50),
+                                  minimumSize: const Size(double.infinity, 40),
+                                ),
+                                child: const Text(
+                                  'Scan QR Code for Attendance',
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
               if (widget.role != 'admin' && gpsEnabled)
                 Container(
                   margin: const EdgeInsets.all(20),
@@ -3172,44 +3437,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           ],
                         ),
                       ],
-                    ],
-                  ),
-                ),
-
-              if (widget.role != 'admin' && !gpsEnabled)
-                Container(
-                  margin: const EdgeInsets.all(20),
-                  padding: const EdgeInsets.all(15),
-                  decoration: BoxDecoration(
-                    color: Colors.red.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(15),
-                    border: Border.all(color: Colors.red.withOpacity(0.3)),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.gps_off, color: Colors.red),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'GPS Disabled',
-                              style: TextStyle(
-                                color: Colors.red,
-                                fontWeight: FontWeight.bold,
+                      if (widget.role == 'student')
+                        Container(
+                          margin: const EdgeInsets.only(top: 15),
+                          child: ElevatedButton(
+                            onPressed: _markAttendanceWithQR,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF4CAF50),
+                              minimumSize: const Size(double.infinity, 45),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
                               ),
                             ),
-                            Text(
-                              'Contact admin to enable GPS tracking',
-                              style: TextStyle(
-                                color: Colors.red.withOpacity(0.8),
-                                fontSize: 12,
-                              ),
+                            child: const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.qr_code_scanner),
+                                SizedBox(width: 10),
+                                Text('Scan QR Code for Attendance'),
+                              ],
                             ),
-                          ],
+                          ),
                         ),
-                      ),
                     ],
                   ),
                 ),
@@ -3430,12 +3679,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } else {
       return [
         _buildDashboardCard(
-          icon: Icons.camera_alt,
+          icon: Icons.qr_code_scanner,
           title: 'Mark Attendance',
-          subtitle: 'Take photo to mark',
-          color: gpsEnabled ? const Color(0xFF4CAF50) : Colors.grey,
+          subtitle: 'Scan QR Code',
+          color: const Color(0xFF4CAF50),
           isDark: isDark,
-          onTap: gpsEnabled ? _showClassroomSelection : null,
+          onTap: _markAttendanceWithQR,
         ),
         _buildDashboardCard(
           icon: Icons.upload_file,
@@ -4002,7 +4251,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               controller: TextEditingController(),
               decoration: const InputDecoration(
                 labelText: 'Reason',
-                labelStyle: const TextStyle(color: Colors.white70),
+                labelStyle: TextStyle(color: Colors.white70),
                 border: OutlineInputBorder(),
               ),
               style: const TextStyle(color: Colors.white),
@@ -4266,79 +4515,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  void _showClassroomSelection() {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: isDark
-            ? const Color(0xFF2D1B69)
-            : const Color(0xFF2575FC),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text(
-          'Select Classroom',
-          style: TextStyle(color: Colors.white),
-        ),
-        content: FutureBuilder<List<Map<String, dynamic>>>(
-          future: DatabaseHelper.instance.getAllClassrooms(),
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const Center(child: CircularProgressIndicator());
-            }
-            if (!snapshot.hasData || snapshot.data!.isEmpty) {
-              return const Center(
-                child: Text(
-                  'No classrooms found',
-                  style: TextStyle(color: Colors.white),
-                ),
-              );
-            }
-
-            return SizedBox(
-              width: double.maxFinite,
-              child: ListView.builder(
-                shrinkWrap: true,
-                itemCount: snapshot.data!.length,
-                itemBuilder: (context, index) {
-                  final classroom = snapshot.data![index];
-                  return ListTile(
-                    leading: const Icon(Icons.class_, color: Color(0xFF4CAF50)),
-                    title: Text(
-                      classroom['name'],
-                      style: const TextStyle(color: Colors.white),
-                    ),
-                    subtitle: Text(
-                      '${classroom['latitude']}, ${classroom['longitude']}',
-                      style: const TextStyle(color: Colors.white70),
-                    ),
-                    trailing: const Icon(
-                      Icons.arrow_forward,
-                      color: Colors.white70,
-                    ),
-                    onTap: () {
-                      Navigator.pop(context);
-                      _markAttendanceWithPhoto(classroom['id']);
-                    },
-                  );
-                },
-              ),
-            );
-          },
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text(
-              'CANCEL',
-              style: TextStyle(color: Colors.white70),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   void _showLocationDetails() {
     if (_currentLocation == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -4520,6 +4696,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 fontSize: 12,
                               ),
                             ),
+                            if (record['qrCodeData'] != null)
+                              Text(
+                                'QR Code: ${record['qrCodeData']}',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12,
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -4702,6 +4886,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 fontSize: 12,
                               ),
                             ),
+                            if (classroom['qrCodeData'] != null)
+                              Text(
+                                'QR Code: ${classroom['qrCodeData']}',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12,
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -5980,12 +6172,13 @@ class UploadPaperDialog extends StatefulWidget {
 class _UploadPaperDialogState extends State<UploadPaperDialog> {
   final TextEditingController _titleController = TextEditingController();
   final TextEditingController _descriptionController = TextEditingController();
+  final TextEditingController _subjectController = TextEditingController(
+    text: 'Computer Science',
+  );
   final ImagePicker _picker = ImagePicker();
   File? _selectedFile;
   String? _selectedFileType;
   String? _selectedFileExtension;
-  String? _selectedSubject = 'Computer Science';
-  final bool _isLoading = false;
   bool _isUploading = false;
 
   // Keep track of upload state
@@ -5995,6 +6188,7 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
   void dispose() {
     _titleController.dispose();
     _descriptionController.dispose();
+    _subjectController.dispose();
     _isCurrentlyUploading = false;
     super.dispose();
   }
@@ -6065,10 +6259,24 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
 
   Future<void> _uploadPaper() async {
     if (_isUploading || _isCurrentlyUploading) return;
-    if (_titleController.text.isEmpty) {
+
+    final title = _titleController.text.trim();
+    final subject = _subjectController.text.trim();
+
+    if (title.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Please enter a title'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    if (subject.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter a subject'),
           duration: Duration(seconds: 2),
         ),
       );
@@ -6093,10 +6301,10 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
     try {
       final paperData = {
         'id': '${widget.userId}_${DateTime.now().millisecondsSinceEpoch}',
-        'title': _titleController.text,
+        'title': title,
         'studentId': widget.userId,
         'studentName': widget.userName,
-        'subject': _selectedSubject!,
+        'subject': subject,
         'date': DateTime.now().toString().split(' ')[0],
         'fileSize': '${_selectedFile!.lengthSync() ~/ 1024}KB',
         'status': widget.isAdmin ? 'approved' : 'pending',
@@ -6131,8 +6339,7 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
           'senderId': widget.userId,
           'senderName': widget.userName,
           'receiverId': 'admin001',
-          'text':
-              '📄 New paper submitted: "${_titleController.text}" for review.',
+          'text': '📄 New paper submitted: "$title" for review.',
           'timestamp': DateTime.now().toString(),
           'isRead': 0,
         });
@@ -6141,6 +6348,7 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
       // Reset form
       _titleController.clear();
       _descriptionController.clear();
+      _subjectController.text = 'Computer Science';
       setState(() {
         _selectedFile = null;
         _selectedFileType = null;
@@ -6213,50 +6421,14 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
                   ],
                 )
               else ...[
-                DropdownButtonFormField<String>(
-                  value: _selectedSubject,
-                  items: const [
-                    DropdownMenuItem(
-                      value: 'Computer Science',
-                      child: Text(
-                        'Computer Science',
-                        style: TextStyle(color: Colors.black),
-                      ),
-                    ),
-                    DropdownMenuItem(
-                      value: 'Mathematics',
-                      child: Text(
-                        'Mathematics',
-                        style: TextStyle(color: Colors.black),
-                      ),
-                    ),
-                    DropdownMenuItem(
-                      value: 'Physics',
-                      child: Text(
-                        'Physics',
-                        style: TextStyle(color: Colors.black),
-                      ),
-                    ),
-                    DropdownMenuItem(
-                      value: 'Chemistry',
-                      child: Text(
-                        'Chemistry',
-                        style: TextStyle(color: Colors.black),
-                      ),
-                    ),
-                    DropdownMenuItem(
-                      value: 'Economics',
-                      child: Text(
-                        'Economics',
-                        style: TextStyle(color: Colors.black),
-                      ),
-                    ),
-                  ],
-                  onChanged: (value) =>
-                      setState(() => _selectedSubject = value),
+                TextField(
+                  controller: _subjectController,
+                  style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     labelText: 'Subject',
                     labelStyle: const TextStyle(color: Colors.white70),
+                    hintText: 'e.g., Computer Science, Physics, Mathematics',
+                    hintStyle: const TextStyle(color: Colors.white54),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8),
                       borderSide: const BorderSide(color: Colors.white70),
@@ -6266,10 +6438,6 @@ class _UploadPaperDialogState extends State<UploadPaperDialog> {
                       borderSide: const BorderSide(color: Colors.white70),
                     ),
                   ),
-                  style: const TextStyle(color: Colors.white),
-                  dropdownColor: isDark
-                      ? const Color(0xFF2D1B69)
-                      : Colors.white,
                 ),
                 const SizedBox(height: 16),
                 TextField(
